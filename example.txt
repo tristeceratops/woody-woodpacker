@@ -1,0 +1,2 @@
+Hello from mmap!
+This file was created and written using mmap.
