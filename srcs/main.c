@@ -1,18 +1,16 @@
 #include "woody_woodpacker.h"
 #include "utils.h"
 #include <stdint.h>
+#include <elf.h>
 
 //e_entry is always at bytes 0x18=24 and it's 8 bytes longs (4 in ELF 32)
-uint64_t getEEntryAddress(int fd)
+Elf64_Ehdr readElfHeader(int fd)
 {
-    uint64_t entry;
-    off_t offset = 0x18;
+	Elf64_Ehdr ehdr;
 
-    lseek(fd, offset, SEEK_SET);
-    read(fd, &entry, sizeof(entry));
-    lseek(fd, 0, SEEK_SET);
+    read(fd, &ehdr, sizeof(ehdr));
 
-    return entry;
+    return ehdr;
 }
 
 int isElf64(int fd){
@@ -46,10 +44,10 @@ int main(void)
 		perror("not elf 64");
 		return 1;
 	}
+    lseek(fd, 0, SEEK_SET);
+	Elf64_Ehdr ehdr = readElfHeader(fd);
 
-	uint64_t entry_adress = getEEntryAddress(fd);
-
-	printf("entry: 0x%1lx\n", entry_adress);
+	printf("raw entry struct = 0x%lx\n", ehdr.e_entry);
 
 	old_size = lseek(fd, 0, SEEK_END);
 	printf("Old size: %ld\n", old_size);
