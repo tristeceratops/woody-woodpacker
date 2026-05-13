@@ -13,6 +13,21 @@ Elf64_Ehdr readElfHeader(int fd)
     return ehdr;
 }
 
+Elf64_Phdr readProgramdHeader(int fd, const Elf64_Ehdr *ehdr, size_t index)
+{
+    Elf64_Phdr phdr = {0};
+    off_t off = (off_t)ehdr->e_phoff + (off_t)(index * ehdr->e_phentsize);
+
+    if (lseek(fd, off, SEEK_SET) == (off_t)-1) {
+        perror("lseek program header");
+        return phdr;
+    }
+    if (read(fd, &phdr, sizeof(phdr)) != (ssize_t)sizeof(phdr)) {
+        perror("read program header");
+    }
+    return phdr;
+}
+
 int isElf64(int fd){
 	char fileHeader[5];
 	char elf64MagicBytes[6] = "\x7f\x45\x4c\x46\x02\x00";
@@ -46,8 +61,10 @@ int main(void)
 	}
     lseek(fd, 0, SEEK_SET);
 	Elf64_Ehdr ehdr = readElfHeader(fd);
+    Elf64_Phdr phdr = readProgramdHeader(fd, &ehdr, 0);
 
 	printf("raw entry struct = 0x%lx\n", ehdr.e_entry);
+    printf("phdr[0].p_type = %u\n", phdr.p_type);
 
 	old_size = lseek(fd, 0, SEEK_END);
 	printf("Old size: %ld\n", old_size);
