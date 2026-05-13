@@ -1,5 +1,19 @@
 #include "woody_woodpacker.h"
 #include "utils.h"
+#include <stdint.h>
+
+//e_entry is always at bytes 0x18=24 and it's 8 bytes longs (4 in ELF 32)
+uint64_t getEEntryAddress(int fd)
+{
+    uint64_t entry;
+    off_t offset = 0x18;
+
+    lseek(fd, offset, SEEK_SET);
+    read(fd, &entry, sizeof(entry));
+    lseek(fd, 0, SEEK_SET);
+
+    return entry;
+}
 
 int isElf64(int fd){
 	char fileHeader[5];
@@ -33,6 +47,10 @@ int main(void)
 		return 1;
 	}
 
+	uint64_t entry_adress = getEEntryAddress(fd);
+
+	printf("entry: 0x%1lx\n", entry_adress);
+
 	old_size = lseek(fd, 0, SEEK_END);
 	printf("Old size: %ld\n", old_size);
 	new_size = old_size + sizeof(payload);
@@ -56,8 +74,6 @@ int main(void)
 	for (size_t i = 0; i < sizeof(payload); i++)
 		mapped[old_size + i] = payload[i];
 	
-	msync(mapped, new_size, MS_SYNC);
-
 	munmap(mapped, new_size);
 	close(fd);
 
