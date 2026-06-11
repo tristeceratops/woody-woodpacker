@@ -69,6 +69,100 @@ int load_section_names(int fd, t_elf64_headers *hdrs)
 	return 1;
 }
 
+int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hdrs)
+{
+	struct stat st;
+	Elf64_Phdr *new_phdr_slot = NULL;
+	unsigned char stub[41] = {
+		0x52,
+		0xb8, 0x01, 0x00, 0x00, 0x00,
+		0xbf, 0x01, 0x00, 0x00, 0x00,
+		0x48, 0xbe,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0xba, 0x00, 0x00, 0x00, 0x00,
+		0x0f, 0x05,
+		0x5a,
+		0x48, 0xb8,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0xff, 0xe0
+	};
+	unsigned char zeros[0x1000] = {0};
+	Elf64_Phdr new_phdr;
+	uint64_t max_vaddr_end = 0;
+	uint64_t new_offset;
+	uint64_t new_vaddr;
+	uint64_t sig_vaddr;
+	uint64_t orig_entry;
+	uint32_t siglen32;
+	size_t siglen;
+	size_t pad;
+
+	if (fd < 0 || !signature || !hdrs || !hdrs->phdr || hdrs->ehdr.e_phnum == 0)
+		return 0;
+	if (fstat(fd, &st) < 0)
+		return 0;
+
+	siglen = strlen(signature);
+	if (siglen == 0)
+		return 0;
+
+	for (size_t i = 0; i < hdrs->ehdr.e_phnum; ++i)
+	{
+		if (hdrs->phdr[i].p_type == PT_LOAD)
+		{
+			uint64_t ph_end = hdrs->phdr[i].p_vaddr + hdrs->phdr[i].p_memsz;
+
+			if (ph_end > max_vaddr_end)
+				max_vaddr_end = ph_end;
+		}
+		else if (!new_phdr_slot && (hdrs->phdr[i].p_type == PT_NULL ||
+			hdrs->phdr[i].p_type == PT_GNU_STACK || hdrs->phdr[i].p_type == PT_GNU_RELRO))
+		{
+			new_phdr_slot = &hdrs->phdr[i];
+		}
+	}
+	if (!new_phdr_slot || max_vaddr_end == 0)
+		return 0;
+
+	orig_entry = hdrs->ehdr.e_entry;
+	siglen32 = (uint32_t)siglen;
+	pad = (0x1000 - ((size_t)st.st_size & 0x0fff)) & 0x0fff;
+	new_offset = (uint64_t)st.st_size + pad;
+	new_vaddr = (max_vaddr_end + 0x0fff) & ~(uint64_t)0x0fff;
+	sig_vaddr = new_vaddr + sizeof(stub);
+
+	memcpy(&stub[13], &sig_vaddr, sizeof(sig_vaddr));
+	memcpy(&stub[22], &siglen32, sizeof(siglen32));
+	memcpy(&stub[31], &orig_entry, sizeof(orig_entry));
+
+	if (pad > 0 && pwrite(fd, zeros, pad, st.st_size) != (ssize_t)pad)
+		return 0;
+	if (pwrite(fd, stub, sizeof(stub), (off_t)new_offset) != (ssize_t)sizeof(stub))
+		return 0;
+	if (pwrite(fd, signature, siglen, (off_t)(new_offset + sizeof(stub))) != (ssize_t)siglen)
+		return 0;
+
+	memset(&new_phdr, 0, sizeof(new_phdr));
+	new_phdr.p_type = PT_LOAD;
+	new_phdr.p_flags = PF_R | PF_X;
+	new_phdr.p_offset = new_offset;
+	new_phdr.p_vaddr = new_vaddr;
+	new_phdr.p_paddr = new_vaddr;
+	new_phdr.p_filesz = sizeof(stub) + siglen;
+	new_phdr.p_memsz = sizeof(stub) + siglen;
+	new_phdr.p_align = 0x1000;
+	*new_phdr_slot = new_phdr;
+	hdrs->ehdr.e_entry = new_vaddr;
+	if (pwrite(fd, &hdrs->ehdr, sizeof(hdrs->ehdr), 0) != (ssize_t)sizeof(hdrs->ehdr))
+		return 0;
+	if (pwrite(fd, hdrs->phdr, hdrs->ehdr.e_phnum * sizeof(Elf64_Phdr), hdrs->ehdr.e_phoff) !=
+		(ssize_t)(hdrs->ehdr.e_phnum * sizeof(Elf64_Phdr)))
+		return 0;
+
+	return 1;
+
+}
+
 t_elf64_headers *load_elf64_headers(int fd)
 {
 	t_elf64_headers *hdrs = NULL;
@@ -214,7 +308,7 @@ void print_elf64_headers(const t_elf64_headers *h)
 int main(int argc, char **argv)
 {
 	const char *path = (argc > 1) ? argv[1] : "test/hello";
-	int fd = open(path, O_RDONLY);
+	int fd = open(path, O_RDWR);
 	if (fd < 0)
 	{
 		perror("open");
@@ -235,10 +329,18 @@ int main(int argc, char **argv)
 		close(fd);
 		return 1;
 	}
-
-	print_elf64_headers(hdrs);
-
-	free_elf64_headers(hdrs);
+	if (!append_stub_and_set_entry(fd, "WoodyWoodpacker\n", hdrs))
+		fprintf(stderr, "failed to append stub and patch entry\n");
 	close(fd);
+
+
+	//print_elf64_headers(hdrs);
+	free_elf64_headers(hdrs);
+
+	//TODO
+	//encrypt text section
+	//add signature + decryption code at the end of (i do not rememember where, looks to PT_LOAD) + encryption code
+	//change entry point to the decryption code
+	//flow of targetede file: print signature + decrypt text section + jump to original entry point and run normally + encrypted text section again
 	return 0;
 }
