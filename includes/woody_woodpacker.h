@@ -27,4 +27,10 @@ typedef struct s_elf64_headers
     t_elf64_section_headers *shdr;
 } t_elf64_headers;
 
+typedef struct s_stub_build_data
+{
+    int phdr_target_index;
+    uint64_t vaddr;
+} t_stub_build_data;
+
 #endif

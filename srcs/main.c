@@ -69,23 +69,123 @@ int load_section_names(int fd, t_elf64_headers *hdrs)
 	return 1;
 }
 
+off_t	get_file_size(int fd)
+{
+    off_t	current_pos;
+    off_t	size;
+
+    current_pos = lseek(fd, 0, SEEK_CUR);
+    if (current_pos == (off_t)-1)
+        return (-1);
+    size = lseek(fd, 0, SEEK_END);
+    if (size == (off_t)-1)
+        return (-1);
+    if (lseek(fd, current_pos, SEEK_SET) == (off_t)-1)
+        return (-1);
+    return (size);
+}
+
+uint64_t get_entry_point(t_elf64_headers *hdrs)
+{
+	return hdrs->ehdr.e_entry;
+}
+// Gather data needed to build the stub: index of a reusable program header
+// (or -1 if none available) and the maximum virtual address occupied by
+// existing PT_LOAD segments. Uses `t_stub_build_data` from the header.
+// more information on p_type value: https://docs.oracle.com/cd/E19683-01/816-1386/chapter6-83432/index.html
+t_stub_build_data get_stub_build_data(t_elf64_headers *hdrs)
+{
+	t_stub_build_data out;
+	out.phdr_target_index = -1;
+	out.vaddr = 0;
+
+	if (!hdrs || !hdrs->phdr)
+		return out;
+
+	for (size_t i = 0; i < hdrs->ehdr.e_phnum; ++i)
+	{
+		if (hdrs->phdr[i].p_type == PT_LOAD)
+		{
+			uint64_t ph_end = hdrs->phdr[i].p_vaddr + hdrs->phdr[i].p_memsz;
+			if (ph_end > out.vaddr)
+				out.vaddr = ph_end;
+		}
+		else if (out.phdr_target_index == -1 &&
+				 (hdrs->phdr[i].p_type == PT_NULL /*||
+				  hdrs->phdr[i].p_type == PT_GNU_STACK ||	don't know why, copilot say that it was safe but need to do research
+				  hdrs->phdr[i].p_type == PT_GNU_RELRO*/
+				  ))
+		{
+			out.phdr_target_index = (int)i;
+		}
+	}
+
+	return out;
+}
+
+// TODO: rewrite it
 int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hdrs)
 {
+	// steps for non-pie binary:
+	// 1) stored original entry point
+	// 2) find free program header slot(why? Because the ELF needs a program header entry to describe the new appended segment.) and the last loadable segment(why? Because the new stub must be placed after all existing mapped code and data, so it does not overwrite anything. The end of the last PT_LOAD segment gives the highest occupied virtual address, which is the reference point for placing the new payload safely.)
+	// 3) compute new offset and new virtual address both aligned to 0x1000(why? Because ELF segments are normally page-aligned, and the kernel maps memory in pages. If the file offset and virtual address are not aligned the way the loader expects, the new segment may fail to load correctly or may be mapped at the wrong address.)
+	// 4) patches the stub with address of signature and original entrypoint
+	// 5) write padding, then stub, then signatures
+	// 6) create new PT_LOAD segment covering the target region
+	// 7) change e_entry to new stub
+
+	size_t siglen;
+	uint32_t siglen32; //need for patch
+	uint64_t orig_entry;
+	off_t file_length;
+	t_stub_build_data stub_build_data;
+
+	unsigned char stub[41] = {
+		0x52,						  						// push rdx -> save the orignal rdx because we will overwrite it and we want to restore it
+		0xb8, 0x01, 0x00, 0x00, 0x00, 						// mov eax, 1 -> syscall number for write
+		0xbf, 0x01, 0x00, 0x00, 0x00, 						// mov edi, 1 -> file descriptor stdout
+		0x48, 0xbe,					  						// movabs rsi, imm64 -> load rsi with the address of signature string (patched after), rsi is buffer for write
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0xba, 0x00, 0x00, 0x00, 0x00, 						// mov edx, imm32 -> load edx with the signature length (patched at runtime)
+		0x0f, 0x05,					  						// syscall -> write(1, rsi, rdx)
+		0x5a,						  						// pop rdx
+		0x48, 0xb8,					  						// movabs rax, imm64 -> load rax with original entry point (patched at runtime)
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0xff, 0xe0}; 										// jmp rax -> jump to original entry point
+
+	if (fd < 0 || !signature || !hdrs || !hdrs->phdr || hdrs->ehdr.e_phnum == 0) // safety check
+		return 0;
+
+	siglen = strlen(signature);
+
+	if (siglen <= 0)
+		return 0;
+
+	stub_build_data = get_stub_build_data(hdrs);
+
+	if (stub_build_data.phdr_target_index == -1 || stub_build_data.vaddr == 0)
+		return 0;
+
+	orig_entry = hdrs->ehdr.e_entry;
+	siglen32 = (uint32_t)siglen;
+	file_length = get_file_size(fd);
+
+	// generated version
 	struct stat st;
 	Elf64_Phdr *new_phdr_slot = NULL;
 	unsigned char stub[41] = {
-		0x52,
-		0xb8, 0x01, 0x00, 0x00, 0x00,
-		0xbf, 0x01, 0x00, 0x00, 0x00,
-		0x48, 0xbe,
+		0x52,						  // push rdx -> save the orignal rdx because we will overwrite it and we want to restore it
+		0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 -> syscall number for write
+		0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1 -> file descriptor stdout
+		0x48, 0xbe,					  // movabs rsi, imm64 -> load rsi with the address of signature string (patched after), rsi is buffer for write
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0xba, 0x00, 0x00, 0x00, 0x00,
-		0x0f, 0x05,
-		0x5a,
-		0x48, 0xb8,
+		0xba, 0x00, 0x00, 0x00, 0x00, // mov edx, imm32 -> load edx with the signature length (patched at runtime)
+		0x0f, 0x05,					  // syscall -> write(1, rsi, rdx)
+		0x5a,						  // pop rdx
+		0x48, 0xb8,					  // movabs rax, imm64 -> load rax with original entry point (patched at runtime)
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0xff, 0xe0
-	};
+		0xff, 0xe0}; // jmp rax -> jump to original entry point
 	unsigned char zeros[0x1000] = {0};
 	Elf64_Phdr new_phdr;
 	uint64_t max_vaddr_end = 0;
@@ -116,7 +216,7 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 				max_vaddr_end = ph_end;
 		}
 		else if (!new_phdr_slot && (hdrs->phdr[i].p_type == PT_NULL ||
-			hdrs->phdr[i].p_type == PT_GNU_STACK || hdrs->phdr[i].p_type == PT_GNU_RELRO))
+									hdrs->phdr[i].p_type == PT_GNU_STACK || hdrs->phdr[i].p_type == PT_GNU_RELRO))
 		{
 			new_phdr_slot = &hdrs->phdr[i];
 		}
@@ -160,7 +260,6 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 		return 0;
 
 	return 1;
-
 }
 
 t_elf64_headers *load_elf64_headers(int fd)
@@ -333,14 +432,13 @@ int main(int argc, char **argv)
 		fprintf(stderr, "failed to append stub and patch entry\n");
 	close(fd);
 
-
-	//print_elf64_headers(hdrs);
+	// print_elf64_headers(hdrs);
 	free_elf64_headers(hdrs);
 
-	//TODO
-	//encrypt text section
-	//add signature + decryption code at the end of (i do not rememember where, looks to PT_LOAD) + encryption code
-	//change entry point to the decryption code
-	//flow of targetede file: print signature + decrypt text section + jump to original entry point and run normally + encrypted text section again
+	// TODO
+	// encrypt text section
+	// add signature + decryption code at the end of (i do not rememember where, looks to PT_LOAD) + encryption code
+	// change entry point to the decryption code
+	// flow of targetede file: print signature + decrypt text section + jump to original entry point and run normally + encrypted text section again
 	return 0;
 }
