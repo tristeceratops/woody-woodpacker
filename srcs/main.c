@@ -69,20 +69,20 @@ int load_section_names(int fd, t_elf64_headers *hdrs)
 	return 1;
 }
 
-off_t	get_file_size(int fd)
+off_t get_file_size(int fd)
 {
-    off_t	current_pos;
-    off_t	size;
+	off_t current_pos;
+	off_t size;
 
-    current_pos = lseek(fd, 0, SEEK_CUR);
-    if (current_pos == (off_t)-1)
-        return (-1);
-    size = lseek(fd, 0, SEEK_END);
-    if (size == (off_t)-1)
-        return (-1);
-    if (lseek(fd, current_pos, SEEK_SET) == (off_t)-1)
-        return (-1);
-    return (size);
+	current_pos = lseek(fd, 0, SEEK_CUR);
+	if (current_pos == (off_t)-1)
+		return (-1);
+	size = lseek(fd, 0, SEEK_END);
+	if (size == (off_t)-1)
+		return (-1);
+	if (lseek(fd, current_pos, SEEK_SET) == (off_t)-1)
+		return (-1);
+	return (size);
 }
 
 uint64_t get_entry_point(t_elf64_headers *hdrs)
@@ -123,6 +123,20 @@ t_stub_build_data get_stub_build_data(t_elf64_headers *hdrs)
 	return out;
 }
 
+ssize_t my_pwrite(int fd, const void *buf, size_t count, off_t offset)
+{
+	return syscall(SYS_pwrite64, fd, buf, count, offset);
+}
+
+ssize_t my_pwritev2(int fd, const void *buf, size_t count, off_t offset)
+{
+	off_t pos = lseek(fd, 0, SEEK_CUR);
+	lseek(fd, offset, SEEK_SET);
+	ssize_t value = write(fd, buf, count);
+	lseek(fd, pos, SEEK_SET);
+	return value;
+}
+
 // TODO: rewrite it
 int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hdrs)
 {
@@ -136,23 +150,28 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 	// 7) change e_entry to new stub
 
 	size_t siglen;
-	uint32_t siglen32; //need for patch
+	uint32_t siglen32; // need for patch
 	uint64_t orig_entry;
 	off_t file_length;
 	t_stub_build_data stub_build_data;
+	size_t pad;
+	uint64_t new_offset;
+	uint64_t new_vaddr;
+	uint64_t sig_vaddr;
+	unsigned char zeros[0x1000] = {0};
 
 	unsigned char stub[41] = {
-		0x52,						  						// push rdx -> save the orignal rdx because we will overwrite it and we want to restore it
-		0xb8, 0x01, 0x00, 0x00, 0x00, 						// mov eax, 1 -> syscall number for write
-		0xbf, 0x01, 0x00, 0x00, 0x00, 						// mov edi, 1 -> file descriptor stdout
-		0x48, 0xbe,					  						// movabs rsi, imm64 -> load rsi with the address of signature string (patched after), rsi is buffer for write
+		0x52,						  // push rdx -> save the orignal rdx because we will overwrite it and we want to restore it
+		0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 -> syscall number for write
+		0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1 -> file descriptor stdout
+		0x48, 0xbe,					  // movabs rsi, imm64 -> load rsi with the address of signature string (patched after), rsi is buffer for write
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0xba, 0x00, 0x00, 0x00, 0x00, 						// mov edx, imm32 -> load edx with the signature length (patched at runtime)
-		0x0f, 0x05,					  						// syscall -> write(1, rsi, rdx)
-		0x5a,						  						// pop rdx
-		0x48, 0xb8,					  						// movabs rax, imm64 -> load rax with original entry point (patched at runtime)
+		0xba, 0x00, 0x00, 0x00, 0x00, // mov edx, imm32 -> load edx with the signature length (patched at runtime)
+		0x0f, 0x05,					  // syscall -> write(1, rsi, rdx)
+		0x5a,						  // pop rdx
+		0x48, 0xb8,					  // movabs rax, imm64 -> load rax with original entry point (patched at runtime)
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0xff, 0xe0}; 										// jmp rax -> jump to original entry point
+		0xff, 0xe0}; // jmp rax -> jump to original entry point
 
 	if (fd < 0 || !signature || !hdrs || !hdrs->phdr || hdrs->ehdr.e_phnum == 0) // safety check
 		return 0;
@@ -167,9 +186,28 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 	if (stub_build_data.phdr_target_index == -1 || stub_build_data.vaddr == 0)
 		return 0;
 
+	// prepare patch for stub
 	orig_entry = hdrs->ehdr.e_entry;
 	siglen32 = (uint32_t)siglen;
 	file_length = get_file_size(fd);
+	new_vaddr = (stub_build_data.vaddr + 0x0fff) & ~(uint64_t)0x0fff;
+	sig_vaddr = new_vaddr + sizeof(stub);
+
+	// patch values in stub
+	memcpy(&stub[13], &sig_vaddr, sizeof(sig_vaddr));
+	memcpy(&stub[22], &siglen32, sizeof(siglen32));
+	memcpy(&stub[31], &orig_entry, sizeof(orig_entry));
+
+	// need to adjust alignment
+	pad = (0x1000 - ((size_t)file_length & 0x0fff)) & 0x0fff;
+	new_offset = (uint64_t)file_length + pad;
+
+	if (pad > 0 && my_pwrite(fd, zeros, pad, file_length) != (ssize_t)pad)
+		return 0;
+	if (my_pwrite(fd, stub, sizeof(stub), (off_t)new_offset) != (ssize_t)sizeof(stub))
+		return 0;
+	if (my_pwrite(fd, signature, siglen, (off_t)(new_offset + sizeof(stub))) != (ssize_t)siglen)
+		return 0;
 
 	// generated version
 	struct stat st;

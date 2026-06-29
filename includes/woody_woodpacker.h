@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <elf.h>
+#include <sys/syscall.h>
 
 typedef struct s_elf64_section_headers
 {
