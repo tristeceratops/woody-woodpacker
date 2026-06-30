@@ -159,18 +159,28 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 	uint64_t sig_vaddr;
 	unsigned char zeros[0x1000] = {0};
 
-	unsigned char stub[41] = {
-		0x52,						  // push rdx -> save the orignal rdx because we will overwrite it and we want to restore it
-		0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 -> syscall number for write
-		0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1 -> file descriptor stdout
-		0x48, 0xbe,					  // movabs rsi, imm64 -> load rsi with the address of signature string (patched after), rsi is buffer for write
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0xba, 0x00, 0x00, 0x00, 0x00, // mov edx, imm32 -> load edx with the signature length (patched at runtime)
-		0x0f, 0x05,					  // syscall -> write(1, rsi, rdx)
-		0x5a,						  // pop rdx
-		0x48, 0xb8,					  // movabs rax, imm64 -> load rax with original entry point (patched at runtime)
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0xff, 0xe0}; // jmp rax -> jump to original entry point
+	unsigned char stub[75] = {
+		/* 0  */ 0x52,											 // push rdx -> save the original rdx
+		/* 1  */ 0x41, 0xb0, 0x00,								 // mov r8b, imm8 -> key (single XOR byte, patch offset 3)
+		/* 4  */ 0x48, 0xb9,									 // movabs rcx, imm64 -> load rcx with .text address
+		/* 6  */ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // text_vaddr placeholder (patch offset 6)
+		/* 14 */ 0xb8, 0x01, 0x00, 0x00, 0x00,					 // mov eax, 1 -> syscall number for write
+		/* 19 */ 0xbf, 0x01, 0x00, 0x00, 0x00,					 // mov edi, 1 -> stdout fd
+		/* 24 */ 0x48, 0xbe,									 // movabs rsi, imm64 -> address of signature string
+		/* 26 */ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // sig_vaddr placeholder (patch offset 26)
+		/* 34 */ 0xba, 0x00, 0x00, 0x00, 0x00,					 // mov edx, imm32 -> signature length (patch offset 35)
+		/* 39 */ 0x0f, 0x05,									 // syscall -> write(1, rsi, rdx)
+		/* 41 */ 0x5a,											 // pop rdx -> restore original rdx
+		/* 42 */ 0xba, 0x00, 0x00, 0x00, 0x00,					 // mov edx, imm32 -> text_len, reused now that siglen is done (patch offset 43)
+		/* 47 */ 0x31, 0xf6,									 // xor esi, esi -> zero rsi, used as the loop index
+		/* 49 */ 0x48, 0x39, 0xd6,								 // loop_start: cmp rsi, rdx -> compare index to text_len
+		/* 52 */ 0x73, 0x09,									 // jae end -> exit loop once index >= text_len
+		/* 54 */ 0x44, 0x30, 0x04, 0x31,						 // xor byte [rcx+rsi], r8b -> decrypt one byte of .text with key
+		/* 58 */ 0x48, 0xff, 0xc6,								 // inc rsi -> advance index by 1
+		/* 61 */ 0xeb, 0xf2,									 // jmp loop_start -> repeat until done
+		/* 63 */ 0x48, 0xb8,									 // end: movabs rax, imm64 -> original entry point
+		/* 65 */ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // orig_entry placeholder (patch offset 65)
+		/* 73 */ 0xff, 0xe0};									 // jmp rax -> jump to decrypted original entry point
 
 	if (fd < 0 || !signature || !hdrs || !hdrs->phdr || hdrs->ehdr.e_phnum == 0) // safety check
 		return 0;
@@ -179,7 +189,6 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 
 	if (siglen <= 0)
 	{
-		printf("Siglen <= 0");
 		return 0;
 	}
 
@@ -198,10 +207,29 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 	new_vaddr = (stub_build_data.vaddr + 0x0fff) & ~(uint64_t)0x0fff;
 	sig_vaddr = new_vaddr + sizeof(stub);
 
+	// Find .text section for encryption key data
+	uint64_t text_vaddr = 0;
+	uint32_t text_len = 0;
+	uint8_t key = 0x42; // Default encryption key
+
+	for (size_t i = 0; i < hdrs->ehdr.e_shnum; i++)
+	{
+		if (hdrs->shdr && hdrs->shdr[i].name_str_format &&
+			strcmp(hdrs->shdr[i].name_str_format, ".text") == 0)
+		{
+			text_vaddr = hdrs->shdr[i].shdr.sh_addr;
+			text_len = (uint32_t)hdrs->shdr[i].shdr.sh_size;
+			break;
+		}
+	}
+
 	// patch values in stub
-	memcpy(&stub[13], &sig_vaddr, sizeof(sig_vaddr));
-	memcpy(&stub[22], &siglen32, sizeof(siglen32));
-	memcpy(&stub[31], &orig_entry, sizeof(orig_entry));
+	memcpy(&stub[3], &key, sizeof(key));				// 1 byte, XOR key in r8b
+	memcpy(&stub[6], &text_vaddr, sizeof(text_vaddr));	// 8 bytes, .text section base address in rcx
+	memcpy(&stub[26], &sig_vaddr, sizeof(sig_vaddr));	// 8 bytes, signature string address in rsi
+	memcpy(&stub[35], &siglen32, sizeof(siglen32));		// 4 bytes, signature length in edx
+	memcpy(&stub[43], &text_len, sizeof(text_len));		// 4 bytes, .text size for decryption loop
+	memcpy(&stub[65], &orig_entry, sizeof(orig_entry)); // 8 bytes, original entry point in rax
 
 	// need to adjust alignment
 	pad = (0x1000 - ((size_t)file_length & 0x0fff)) & 0x0fff; // 0x1000 = 4096; 0x0fff = 4095
@@ -216,6 +244,7 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 
 	Elf64_Phdr new_phdr;
 
+	//set new phdr to fit values of the stub
 	memset(&new_phdr, 0, sizeof(new_phdr));
 	new_phdr.p_type = PT_LOAD;
 	new_phdr.p_flags = PF_R | PF_X;
@@ -234,97 +263,6 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 		return 0;
 
 	return 1;
-	/*
-		// generated version
-		struct stat st;
-		Elf64_Phdr *new_phdr_slot = NULL;
-		unsigned char stub[41] = {
-			0x52,						  // push rdx -> save the orignal rdx because we will overwrite it and we want to restore it
-			0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 -> syscall number for write
-			0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1 -> file descriptor stdout
-			0x48, 0xbe,					  // movabs rsi, imm64 -> load rsi with the address of signature string (patched after), rsi is buffer for write
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0xba, 0x00, 0x00, 0x00, 0x00, // mov edx, imm32 -> load edx with the signature length (patched at runtime)
-			0x0f, 0x05,					  // syscall -> write(1, rsi, rdx)
-			0x5a,						  // pop rdx
-			0x48, 0xb8,					  // movabs rax, imm64 -> load rax with original entry point (patched at runtime)
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0xff, 0xe0}; // jmp rax -> jump to original entry point
-		unsigned char zeros[0x1000] = {0};
-		Elf64_Phdr new_phdr;
-		uint64_t max_vaddr_end = 0;
-		uint64_t new_offset;
-		uint64_t new_vaddr;
-		uint64_t sig_vaddr;
-		uint64_t orig_entry;
-		uint32_t siglen32;
-		size_t siglen;
-		size_t pad;
-
-		if (fd < 0 || !signature || !hdrs || !hdrs->phdr || hdrs->ehdr.e_phnum == 0)
-			return 0;
-		if (fstat(fd, &st) < 0)
-			return 0;
-
-		siglen = strlen(signature);
-		if (siglen == 0)
-			return 0;
-
-		for (size_t i = 0; i < hdrs->ehdr.e_phnum; ++i)
-		{
-			if (hdrs->phdr[i].p_type == PT_LOAD)
-			{
-				uint64_t ph_end = hdrs->phdr[i].p_vaddr + hdrs->phdr[i].p_memsz;
-
-				if (ph_end > max_vaddr_end)
-					max_vaddr_end = ph_end;
-			}
-			else if (!new_phdr_slot && (hdrs->phdr[i].p_type == PT_NULL ||
-										hdrs->phdr[i].p_type == PT_GNU_STACK || hdrs->phdr[i].p_type == PT_GNU_RELRO))
-			{
-				new_phdr_slot = &hdrs->phdr[i];
-			}
-		}
-		if (!new_phdr_slot || max_vaddr_end == 0)
-			return 0;
-
-		orig_entry = hdrs->ehdr.e_entry;
-		siglen32 = (uint32_t)siglen;
-		pad = (0x1000 - ((size_t)st.st_size & 0x0fff)) & 0x0fff;
-		new_offset = (uint64_t)st.st_size + pad;
-		new_vaddr = (max_vaddr_end + 0x0fff) & ~(uint64_t)0x0fff;
-		sig_vaddr = new_vaddr + sizeof(stub);
-
-		memcpy(&stub[13], &sig_vaddr, sizeof(sig_vaddr));
-		memcpy(&stub[22], &siglen32, sizeof(siglen32));
-		memcpy(&stub[31], &orig_entry, sizeof(orig_entry));
-
-		if (pad > 0 && pwrite(fd, zeros, pad, st.st_size) != (ssize_t)pad)
-			return 0;
-		if (pwrite(fd, stub, sizeof(stub), (off_t)new_offset) != (ssize_t)sizeof(stub))
-			return 0;
-		if (pwrite(fd, signature, siglen, (off_t)(new_offset + sizeof(stub))) != (ssize_t)siglen)
-			return 0;
-
-		memset(&new_phdr, 0, sizeof(new_phdr));
-		new_phdr.p_type = PT_LOAD;
-		new_phdr.p_flags = PF_R | PF_X;
-		new_phdr.p_offset = new_offset;
-		new_phdr.p_vaddr = new_vaddr;
-		new_phdr.p_paddr = new_vaddr;
-		new_phdr.p_filesz = sizeof(stub) + siglen;
-		new_phdr.p_memsz = sizeof(stub) + siglen;
-		new_phdr.p_align = 0x1000;
-		*new_phdr_slot = new_phdr;
-		hdrs->ehdr.e_entry = new_vaddr;
-		if (pwrite(fd, &hdrs->ehdr, sizeof(hdrs->ehdr), 0) != (ssize_t)sizeof(hdrs->ehdr))
-			return 0;
-		if (pwrite(fd, hdrs->phdr, hdrs->ehdr.e_phnum * sizeof(Elf64_Phdr), hdrs->ehdr.e_phoff) !=
-			(ssize_t)(hdrs->ehdr.e_phnum * sizeof(Elf64_Phdr)))
-			return 0;
-
-		return 1;
-		*/
 }
 
 t_elf64_headers *load_elf64_headers(int fd)
