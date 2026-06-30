@@ -136,85 +136,8 @@ ssize_t my_pwritev2(int fd, const void *buf, size_t count, off_t offset)
 	return value;
 }
 
-// Encrypt or decrypt a buffer using simple XOR cipher
-// key: single byte XOR key
-// data: pointer to data to encrypt/decrypt
-// len: length of data
-void xor_encrypt_decrypt(unsigned char *data, size_t len, uint8_t key)
-{
-	if (!data || len == 0)
-		return;
-	for (size_t i = 0; i < len; i++)
-		data[i] ^= key;
-}
-
-// Encrypt the .text section in the ELF file
-// Returns 1 on success, 0 on failure
-int encrypt_text_section(int fd, t_elf64_headers *hdrs, uint8_t key)
-{
-	Elf64_Shdr *text_shdr = NULL;
-	unsigned char *text_data = NULL;
-	ssize_t bytes_read;
-
-	if (fd < 0 || !hdrs || !hdrs->shdr)
-		return 0;
-
-	// Find .text section header
-	for (size_t i = 0; i < hdrs->ehdr.e_shnum; i++)
-	{
-		if (hdrs->shdr[i].name_str_format &&
-		    strcmp(hdrs->shdr[i].name_str_format, ".text") == 0)
-		{
-			text_shdr = &hdrs->shdr[i].shdr;
-			break;
-		}
-	}
-
-	if (!text_shdr || text_shdr->sh_size == 0)
-		return 0;
-
-	// Allocate buffer for .text section
-	text_data = malloc(text_shdr->sh_size);
-	if (!text_data)
-		return 0;
-
-	// Read .text section from file
-	if (lseek(fd, (off_t)text_shdr->sh_offset, SEEK_SET) == (off_t)-1)
-	{
-		free(text_data);
-		return 0;
-	}
-
-	bytes_read = read(fd, text_data, text_shdr->sh_size);
-	if (bytes_read != (ssize_t)text_shdr->sh_size)
-	{
-		free(text_data);
-		return 0;
-	}
-
-	// Encrypt the data in-memory
-	xor_encrypt_decrypt(text_data, text_shdr->sh_size, key);
-
-	// Write encrypted data back to file
-	if (lseek(fd, (off_t)text_shdr->sh_offset, SEEK_SET) == (off_t)-1)
-	{
-		free(text_data);
-		return 0;
-	}
-
-	if (pwrite(fd, text_data, text_shdr->sh_size, (off_t)text_shdr->sh_offset) !=
-	    (ssize_t)text_shdr->sh_size)
-	{
-		free(text_data);
-		return 0;
-	}
-
-	free(text_data);
-	return 1;
-}
-
 // TODO: rewrite it
-int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hdrs)
+int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hdrs, uint32_t key)
 {
 	// steps for non-pie binary:
 	// 1) stored original entry point
@@ -236,9 +159,9 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 	uint64_t sig_vaddr;
 	unsigned char zeros[0x1000] = {0};
 
-	unsigned char stub[75] = {
+	unsigned char stub[78] = {
 		/* 0  */ 0x52,											 // push rdx -> save the original rdx
-		/* 1  */ 0x41, 0xb0, 0x00,								 // mov r8b, imm8 -> key (single XOR byte, patch offset 3)
+		/* 1  */ 0x41, 0xb8, 0x00, 0x00, 0x00, 0x00,			 // mov r8b, imm32 -> key, patch offset 3 4 bytes long
 		/* 4  */ 0x48, 0xb9,									 // movabs rcx, imm64 -> load rcx with .text address
 		/* 6  */ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // text_vaddr placeholder (patch offset 6)
 		/* 14 */ 0xb8, 0x01, 0x00, 0x00, 0x00,					 // mov eax, 1 -> syscall number for write
@@ -277,16 +200,6 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 		return 0;
 	}
 
-	// Encryption key for .text section
-	uint8_t key = 0x42;
-
-	// Encrypt .text section before appending stub
-	if (!encrypt_text_section(fd, hdrs, key))
-	{
-		printf("failed to encrypt .text section\n");
-		return 0;
-	}
-
 	// prepare patch for stub
 	orig_entry = hdrs->ehdr.e_entry;
 	siglen32 = (uint32_t)siglen;
@@ -310,12 +223,12 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 	}
 
 	// patch values in stub
-	memcpy(&stub[3], &key, sizeof(key));				// 1 byte, XOR key in r8b
-	memcpy(&stub[6], &text_vaddr, sizeof(text_vaddr));	// 8 bytes, .text section base address in rcx
-	memcpy(&stub[26], &sig_vaddr, sizeof(sig_vaddr));	// 8 bytes, signature string address in rsi
-	memcpy(&stub[35], &siglen32, sizeof(siglen32));		// 4 bytes, signature length in edx
-	memcpy(&stub[43], &text_len, sizeof(text_len));		// 4 bytes, .text size for decryption loop
-	memcpy(&stub[65], &orig_entry, sizeof(orig_entry)); // 8 bytes, original entry point in rax
+	memcpy(&stub[3], &key, sizeof(key));				// 4 bytes, custom value, loaded into ecx (will be overwritten below)
+	memcpy(&stub[9], &text_vaddr, sizeof(text_vaddr));	// 8 bytes, .text section base address, loaded into rcx
+	memcpy(&stub[29], &sig_vaddr, sizeof(sig_vaddr));	// 8 bytes, signature string address, loaded into rsi
+	memcpy(&stub[38], &siglen32, sizeof(siglen32));		// 4 bytes, signature length, loaded into edx
+	memcpy(&stub[46], &text_len, sizeof(text_len));		// 4 bytes, number of bytes in .text to decrypt
+	memcpy(&stub[68], &orig_entry, sizeof(orig_entry)); // 8 bytes, original entry point, loaded into rax
 
 	// need to adjust alignment
 	pad = (0x1000 - ((size_t)file_length & 0x0fff)) & 0x0fff; // 0x1000 = 4096; 0x0fff = 4095
@@ -330,7 +243,7 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 
 	Elf64_Phdr new_phdr;
 
-	//set new phdr to fit values of the stub
+	// set new phdr to fit values of the stub
 	memset(&new_phdr, 0, sizeof(new_phdr));
 	new_phdr.p_type = PT_LOAD;
 	new_phdr.p_flags = PF_R | PF_X;
@@ -493,10 +406,175 @@ void print_elf64_headers(const t_elf64_headers *h)
 	}
 }
 
+uint32_t generate_key()
+{
+	uint32_t key;
+	int fd = open("/dev/urandom", O_RDONLY);
+	ssize_t bytes = read(fd, &key, sizeof(key));
+	if (bytes != sizeof(key))
+		exit(1);
+	close(fd);
+	printf("key = %x\n", key);
+	return key;
+}
+
+Elf64_Shdr *find_text_section(t_elf64_headers *hdrs)
+{
+	if (!hdrs || !hdrs->shdr)
+		return NULL;
+	for (size_t i = 0; i < hdrs->ehdr.e_shnum; i++)
+	{
+		if (hdrs->shdr[i].name_str_format &&
+			strcmp(hdrs->shdr[i].name_str_format, ".text") == 0)
+			return &hdrs->shdr[i].shdr;
+	}
+	return NULL;
+}
+
+int encrypt_text_section(int fd, Elf64_Shdr *text_shdr, uint32_t key)
+{
+	unsigned char *buf;
+	unsigned char *key_bytes;
+
+	if (fd < 0 || !text_shdr || text_shdr->sh_size == 0)
+		return 0;
+
+	buf = malloc(text_shdr->sh_size);
+	if (!buf)
+		return 0;
+
+	// fetches .text section load into buf
+	if (pread(fd, buf, text_shdr->sh_size, text_shdr->sh_offset) != (ssize_t)text_shdr->sh_size)
+	{
+		free(buf);
+		return 0;
+	}
+
+	key_bytes = (unsigned char *)&key;
+	for (size_t i = 0; i < text_shdr->sh_size; i++)
+		buf[i] ^= key_bytes[i % sizeof(key)];
+
+	// load encrypted .text back to the file
+	if (pwrite(fd, buf, text_shdr->sh_size, text_shdr->sh_offset) != (ssize_t)text_shdr->sh_size)
+	{
+		free(buf);
+		return 0;
+	}
+
+	free(buf);
+	return 1;
+}
+
+// Copy ELF file to "woody" and make .text section writable
+// Returns file descriptor of the copy, or -1 on failure
+int create_elfcopy(int fd, const char *path)
+{
+	int fd_copy;
+	char copy_path[512];
+	char *dir_end;
+	off_t file_size;
+	void *src_map;
+	ssize_t written;
+
+	if (fd < 0 || !path)
+		return (-1);
+
+	/* create "woody" beside the original */
+	strncpy(copy_path, path, sizeof(copy_path) - 1);
+	copy_path[sizeof(copy_path) - 1] = '\0';
+
+	dir_end = strrchr(copy_path, '/');
+	if (dir_end)
+		strcpy(dir_end + 1, "woody");
+	else
+		strcpy(copy_path, "woody");
+
+	file_size = lseek(fd, 0, SEEK_END);
+	if (file_size < 0)
+		return (-1);
+
+	fd_copy = open(copy_path, O_CREAT | O_RDWR | O_TRUNC, 0755);
+	if (fd_copy < 0)
+		return (-1);
+
+	src_map = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (src_map == MAP_FAILED)
+	{
+		close(fd_copy);
+		return (-1);
+	}
+
+	written = write(fd_copy, src_map, file_size);
+	munmap(src_map, file_size);
+
+	if (written != file_size)
+	{
+		close(fd_copy);
+		return (-1);
+	}
+
+	t_elf64_headers *hdrs = load_elf64_headers(fd_copy);
+	if (!hdrs)
+	{
+		close(fd_copy);
+		return (-1);
+	}
+
+	/* find .text */
+	Elf64_Shdr *text = NULL;
+
+	for (size_t i = 0; i < hdrs->ehdr.e_shnum; i++)
+	{
+		if (!strcmp(hdrs->shdr[i].name_str_format, ".text"))
+		{
+			text = &hdrs->shdr[i].shdr;
+			break;
+		}
+	}
+
+	if (!text)
+	{
+		free_elf64_headers(hdrs);
+		close(fd_copy);
+		return (-1);
+	}
+
+	/* make the PT_LOAD containing .text writable */
+	for (size_t i = 0; i < hdrs->ehdr.e_phnum; i++)
+	{
+		Elf64_Phdr *ph = &hdrs->phdr[i];
+
+		if (ph->p_type != PT_LOAD)
+			continue;
+
+		/*if (text->sh_addr >= ph->p_vaddr &&
+			text->sh_addr < ph->p_vaddr + ph->p_memsz)
+		{*/
+		ph->p_flags |= PF_W;
+		// break;
+		//}
+	}
+
+	/* write modified program headers */
+	if (pwrite(fd_copy,
+			   hdrs->phdr,
+			   hdrs->ehdr.e_phnum * sizeof(Elf64_Phdr),
+			   hdrs->ehdr.e_phoff) != (ssize_t)(hdrs->ehdr.e_phnum * sizeof(Elf64_Phdr)))
+	{
+		free_elf64_headers(hdrs);
+		close(fd_copy);
+		return (-1);
+	}
+
+	free_elf64_headers(hdrs);
+	return (fd_copy);
+}
+
 int main(int argc, char **argv)
 {
 	const char *path = (argc > 1) ? argv[1] : "test/hello";
 	int fd = open(path, O_RDWR);
+	uint32_t key = generate_key();
 	if (fd < 0)
 	{
 		perror("open");
@@ -510,16 +588,20 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	t_elf64_headers *hdrs = load_elf64_headers(fd);
+	int fd_copy = create_elfcopy(fd, path);
+
+	t_elf64_headers *hdrs = load_elf64_headers(fd_copy);
 	if (!hdrs)
 	{
 		fprintf(stderr, "failed to load ELF headers\n");
 		close(fd);
+		close(fd_copy);
 		return 1;
 	}
-	if (!append_stub_and_set_entry(fd, "WoodyWoodpacker\n", hdrs))
+	if (!append_stub_and_set_entry(fd_copy, "WoodyWoodpacker\n", hdrs, key))
 		fprintf(stderr, "failed to append stub and patch entry\n");
 	close(fd);
+	close(fd_copy);
 
 	// print_elf64_headers(hdrs);
 	free_elf64_headers(hdrs);
@@ -529,5 +611,12 @@ int main(int argc, char **argv)
 	// add signature + decryption code at the end of (i do not rememember where, looks to PT_LOAD) + encryption code
 	// change entry point to the decryption code
 	// flow of targetede file: print signature + decrypt text section + jump to original entry point and run normally + encrypted text section again
+	Elf64_Shdr *text_shdr = find_text_section(hdrs);
+	if (!text_shdr)
+		exit(1);
+	if (!encrypt_text_section(fd, text_shdr, key))
+		fprintf(stderr, "failed to encrypt .text\n");
+	close(fd);
+
 	return 0;
 }
