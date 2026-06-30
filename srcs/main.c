@@ -136,6 +136,83 @@ ssize_t my_pwritev2(int fd, const void *buf, size_t count, off_t offset)
 	return value;
 }
 
+// Encrypt or decrypt a buffer using simple XOR cipher
+// key: single byte XOR key
+// data: pointer to data to encrypt/decrypt
+// len: length of data
+void xor_encrypt_decrypt(unsigned char *data, size_t len, uint8_t key)
+{
+	if (!data || len == 0)
+		return;
+	for (size_t i = 0; i < len; i++)
+		data[i] ^= key;
+}
+
+// Encrypt the .text section in the ELF file
+// Returns 1 on success, 0 on failure
+int encrypt_text_section(int fd, t_elf64_headers *hdrs, uint8_t key)
+{
+	Elf64_Shdr *text_shdr = NULL;
+	unsigned char *text_data = NULL;
+	ssize_t bytes_read;
+
+	if (fd < 0 || !hdrs || !hdrs->shdr)
+		return 0;
+
+	// Find .text section header
+	for (size_t i = 0; i < hdrs->ehdr.e_shnum; i++)
+	{
+		if (hdrs->shdr[i].name_str_format &&
+		    strcmp(hdrs->shdr[i].name_str_format, ".text") == 0)
+		{
+			text_shdr = &hdrs->shdr[i].shdr;
+			break;
+		}
+	}
+
+	if (!text_shdr || text_shdr->sh_size == 0)
+		return 0;
+
+	// Allocate buffer for .text section
+	text_data = malloc(text_shdr->sh_size);
+	if (!text_data)
+		return 0;
+
+	// Read .text section from file
+	if (lseek(fd, (off_t)text_shdr->sh_offset, SEEK_SET) == (off_t)-1)
+	{
+		free(text_data);
+		return 0;
+	}
+
+	bytes_read = read(fd, text_data, text_shdr->sh_size);
+	if (bytes_read != (ssize_t)text_shdr->sh_size)
+	{
+		free(text_data);
+		return 0;
+	}
+
+	// Encrypt the data in-memory
+	xor_encrypt_decrypt(text_data, text_shdr->sh_size, key);
+
+	// Write encrypted data back to file
+	if (lseek(fd, (off_t)text_shdr->sh_offset, SEEK_SET) == (off_t)-1)
+	{
+		free(text_data);
+		return 0;
+	}
+
+	if (pwrite(fd, text_data, text_shdr->sh_size, (off_t)text_shdr->sh_offset) !=
+	    (ssize_t)text_shdr->sh_size)
+	{
+		free(text_data);
+		return 0;
+	}
+
+	free(text_data);
+	return 1;
+}
+
 // TODO: rewrite it
 int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hdrs)
 {
@@ -200,6 +277,16 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 		return 0;
 	}
 
+	// Encryption key for .text section
+	uint8_t key = 0x42;
+
+	// Encrypt .text section before appending stub
+	if (!encrypt_text_section(fd, hdrs, key))
+	{
+		printf("failed to encrypt .text section\n");
+		return 0;
+	}
+
 	// prepare patch for stub
 	orig_entry = hdrs->ehdr.e_entry;
 	siglen32 = (uint32_t)siglen;
@@ -210,7 +297,6 @@ int append_stub_and_set_entry(int fd, const char *signature, t_elf64_headers *hd
 	// Find .text section for encryption key data
 	uint64_t text_vaddr = 0;
 	uint32_t text_len = 0;
-	uint8_t key = 0x42; // Default encryption key
 
 	for (size_t i = 0; i < hdrs->ehdr.e_shnum; i++)
 	{
